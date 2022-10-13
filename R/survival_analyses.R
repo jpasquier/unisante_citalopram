@@ -163,44 +163,48 @@ for (s in names(km.figs)) {
 }
 rm(fig, s)
 
-# Differences at 12 months
+# Differences at 1, 2, 3, 6 and 12 months
 # https://dominicmagirr.github.io/post/2022-01-18-be-careful-with-standard-errors-in-survival-survfit/
-diff.12m <- do.call(rbind, lapply(c('naive', 'ltrunc'), function(u) {
-  fit <- km.fit[[u]]
-  tidy(fit) %>%
-    mutate(
-      strata = sub('^Pheno2C19=', '', strata),
-      var.survival = estimate^2 * std.error^2,
-      var.log.survival = std.error^2,
-    ) %>%
-    group_by(strata) %>%
-    filter(time == max(time[time <= 365])) %>%
-    {
-      s <- .$strata
-      e <- .$estimate
-      v <- .$var.survival
-      w <- .$var.log.survival
-      do.call(rbind, lapply(1:(length(s) - 1), function(i) {
-        do.call(rbind, lapply((i + 1):length(s), function(j) {
-          z.plain <- abs(e[i] - e[j]) / sqrt(v[i] + v[j])
-          z.log <- abs(log(e[i]) - log(e[j])) / sqrt(w[i] + w[j])
-          data.frame(
-            fit = u,
-            strata1 = s[i],
-            strata2 = s[j],
-            estimate1 = e[i],
-            estimate2 = e[j],
-            variance1 = v[i],
-            variance2 = v[j],
-            p.value.plain = 2 * (1 - pnorm(z.plain)),
-            p.value.log = 2 * (1 - pnorm(z.log))
-          )
+diffs <- do.call(rbind, lapply(round(365.2425 / 12 * c(1:3, 6, 12)),
+                               function(d) {
+  do.call(rbind, lapply(c('naive', 'ltrunc'), function(u) {
+    fit <- km.fit[[u]]
+    tidy(fit) %>%
+      mutate(
+        strata = sub('^Pheno2C19=', '', strata),
+        var.survival = estimate^2 * std.error^2,
+        var.log.survival = std.error^2,
+      ) %>%
+      group_by(strata) %>%
+      filter(time == suppressWarnings(max(time[time <= d]))) %>%
+      {
+        s <- .$strata
+        e <- .$estimate
+        v <- .$var.survival
+        w <- .$var.log.survival
+        do.call(rbind, lapply(1:(length(s) - 1), function(i) {
+          do.call(rbind, lapply((i + 1):length(s), function(j) {
+            z.plain <- abs(e[i] - e[j]) / sqrt(v[i] + v[j])
+            z.log <- abs(log(e[i]) - log(e[j])) / sqrt(w[i] + w[j])
+            data.frame(
+              day = d,
+              fit = u,
+              strata1 = s[i],
+              strata2 = s[j],
+              estimate1 = e[i],
+              estimate2 = e[j],
+              variance1 = v[i],
+              variance2 = v[j],
+              p.value.plain = 2 * (1 - pnorm(z.plain)),
+              p.value.log = 2 * (1 - pnorm(z.log))
+            )
+          }))
         }))
-      }))
-    }
+      }
+  }))
 }))
-rownames(diff.12m) <- NULL
-write_xlsx(diff.12m, file.path(outdir, 'diff_12m.xlsx'))
+rownames(diffs) <- NULL
+write_xlsx(diffs, file.path(outdir, 'diffs.xlsx'))
 
 ###############################################################################
 # survfit(SurvLeftTrunc ~ Pheno2C19, survData, conf.type = 'log') %>%
