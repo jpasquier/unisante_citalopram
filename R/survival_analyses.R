@@ -11,7 +11,7 @@ library(writexl)
 setwd('~/Projects/Consultations/Coumau Aude (CYP2C19)')
 
 # Criterion
-K <- 2
+K <- 1
 
 # Output directory
 outdir <- paste0('results/survival_analyses_', format(Sys.Date(), '%Y%m%d'),
@@ -70,6 +70,7 @@ survData <- rawData %>%
     Observed = !(Event & DateFirstObs == DateAfterEvent |
                  !Event & DateFirstObs == DateBeforeEvent),
     TimeFirstObs = as.numeric(DateFirstObs - DateInitTTT),
+    Obs365 = Observed & TimeFirstObs <= 365,
     TimeBeforeEvent = if_else(
       Observed, as.numeric(DateBeforeEvent - DateInitTTT), NA_real_),
     TimeAfterEvent = if_else(
@@ -77,9 +78,6 @@ survData <- rawData %>%
     TimeSurv = if_else(Event, TimeAfterEvent, TimeBeforeEvent),
     # TimeSurv = if_else(Event, (TimeAfterEvent - TimeBeforeEvent) / 2,
     #                    TimeBeforeEvent),
-    SurvNaive = Surv(TimeSurv, Event),
-    SurvInterval = Surv(time = TimeBeforeEvent, time2 = TimeAfterEvent,
-                        type = 'interval2'),
     SurvLeftTrunc = Surv(time = TimeFirstObs, time2 = TimeSurv, event = Event)
   )
 
@@ -100,63 +98,61 @@ svg(file.path(outdir, 'surv_paths.svg'), width = 14, height = 35)
 print(surv.paths)
 dev.off()
 
-
 # KM analyses
 # Log rank test with left truncated data:
 # see https://stat.ethz.ch/pipermail/r-help/2009-August/399999.html
 km.fit <- list(
-  naive    = survfit(SurvNaive ~ Pheno2C19, survData, conf.type = 'plain'),
-  interval = survfit(SurvInterval ~ Pheno2C19, survData, conf.type = 'plain'),
-  ltrunc   = survfit(SurvLeftTrunc ~ Pheno2C19, survData, conf.type = 'plain')
+  ltrunc    = survfit(SurvLeftTrunc ~ Pheno2C19, filter(survData, Observed)),
+  ltrunc365 = survfit(SurvLeftTrunc ~ Pheno2C19, filter(survData, Obs365))
 )
 
 # Log rank test p-values
-km.sdf.naive <- survdiff(SurvNaive ~ Pheno2C19, survData)
-1 - pchisq(km.sdf.naive$chisq, length(km.sdf.naive$n) - 1)
-cox.fit.naive <- coxph(SurvNaive ~ Pheno2C19, survData)
-summary(cox.fit.naive)$sctest['pvalue']
-cox.fit.ltrunc <- coxph(SurvLeftTrunc ~ Pheno2C19, survData)
+cox.fit.ltrunc <- coxph(SurvLeftTrunc ~ Pheno2C19, filter(survData, Observed))
 summary(cox.fit.ltrunc)$sctest['pvalue']
+cox.fit.ltrunc365 <- coxph(SurvLeftTrunc ~ Pheno2C19, filter(survData, Obs365))
+summary(cox.fit.ltrunc365)$sctest['pvalue']
+
+# Export survival data
+list(
+  data = survData,
+  table_ltrunc = tidy(km.fit$ltrunc),
+  table_ltrunc365 = tidy(km.fit$ltrunc365)
+) %>%
+  write_xlsx(file.path(outdir, 'survival_data.xlsx'))
 
 # KM curves
 km.figs <- lapply(names(km.fit) %>% setNames(., .), function(s) {
   fit <- km.fit[[s]]
-  lapply(c(full = 1, truncated = 2), function(k) {
-    if (k == 1) {
-      p <- ggsurvplot(
-        fit,
-        conf.int = TRUE,
-        risk.table = TRUE,
-        risk.table.col = "strata",
-        ggtheme = theme_bw(),
-        palette = wes_palette('Darjeeling1', length(fit$strata))
-      )
-    } else {
-      p <- ggsurvplot(
-        fit,
-        conf.int = TRUE,
-        risk.table = TRUE,
-        risk.table.col = "strata",
-        ggtheme = theme_bw(),
-        palette = wes_palette('Darjeeling1', length(fit$strata)),
-        xlim = c(0, 400),
-        break.time.by = 30
-      )
-    }
+  if (s == 'ltrunc') {
+    p <- ggsurvplot(
+      fit,
+      pval = round(summary(get(paste0('cox.fit.', s)))$sctest['pvalue'], 3),
+      conf.int = TRUE,
+      risk.table = TRUE,
+      risk.table.col = "strata",
+      ggtheme = theme_bw(),
+      palette = wes_palette('Darjeeling1', length(fit$strata))
+    )
     p$plot <- p$plot +
       geom_vline(xintercept = 365, color = 'grey', linetype = 'dashed')
-    ttl <- c(
-      naive    = 'Right censoring',
-      interval = 'Interval censoring',
-      ltrunc   = 'Left truncation and right censoring'
-    )[s]
-    p + labs(title = ttl)
-  })
+  } else {
+    p <- ggsurvplot(
+      fit,
+      pval = round(summary(get(paste0('cox.fit.', s)))$sctest['pvalue'], 3),
+      conf.int = TRUE,
+      risk.table = TRUE,
+      risk.table.col = "strata",
+      ggtheme = theme_bw(),
+      xlim = c(0, 365),
+      break.time.by = 30,
+      palette = wes_palette('Darjeeling1', length(fit$strata))
+    )
+  }
+  p
 })
-km.figs <- unlist(km.figs, recursive = FALSE)
 for (s in names(km.figs)) {
   fig <- km.figs[[s]]
-  svg(file.path(outdir, paste0('km_', sub('\\.', '_', s), '.svg')),
+  svg(file.path(outdir, paste0('km_', s, '.svg')),
       width = 14, height = 7)
   print(fig)
   dev.off()
@@ -167,41 +163,38 @@ rm(fig, s)
 # https://dominicmagirr.github.io/post/2022-01-18-be-careful-with-standard-errors-in-survival-survfit/
 diffs <- do.call(rbind, lapply(round(365.2425 / 12 * c(1:3, 6, 12)),
                                function(d) {
-  do.call(rbind, lapply(c('naive', 'ltrunc'), function(u) {
-    fit <- km.fit[[u]]
-    tidy(fit) %>%
-      mutate(
-        strata = sub('^Pheno2C19=', '', strata),
-        var.survival = estimate^2 * std.error^2,
-        var.log.survival = std.error^2,
-      ) %>%
-      group_by(strata) %>%
-      filter(time == suppressWarnings(max(time[time <= d]))) %>%
-      {
-        s <- .$strata
-        e <- .$estimate
-        v <- .$var.survival
-        w <- .$var.log.survival
-        do.call(rbind, lapply(1:(length(s) - 1), function(i) {
-          do.call(rbind, lapply((i + 1):length(s), function(j) {
-            z.plain <- abs(e[i] - e[j]) / sqrt(v[i] + v[j])
-            z.log <- abs(log(e[i]) - log(e[j])) / sqrt(w[i] + w[j])
-            data.frame(
-              day = d,
-              fit = u,
-              strata1 = s[i],
-              strata2 = s[j],
-              estimate1 = e[i],
-              estimate2 = e[j],
-              variance1 = v[i],
-              variance2 = v[j],
-              p.value.plain = 2 * (1 - pnorm(z.plain)),
-              p.value.log = 2 * (1 - pnorm(z.log))
-            )
-          }))
+  fit <- km.fit$ltrunc365
+  tidy(fit) %>%
+    mutate(
+      strata = sub('^Pheno2C19=', '', strata),
+      var.survival = estimate^2 * std.error^2,
+      var.log.survival = std.error^2,
+    ) %>%
+    group_by(strata) %>%
+    filter(time == suppressWarnings(max(time[time <= d]))) %>%
+    {
+      s <- .$strata
+      e <- .$estimate
+      v <- .$var.survival
+      w <- .$var.log.survival
+      do.call(rbind, lapply(1:(length(s) - 1), function(i) {
+        do.call(rbind, lapply((i + 1):length(s), function(j) {
+          z.plain <- abs(e[i] - e[j]) / sqrt(v[i] + v[j])
+          z.log <- abs(log(e[i]) - log(e[j])) / sqrt(w[i] + w[j])
+          data.frame(
+            day = d,
+            fit = 'ltrunc365',
+            strata1 = s[i],
+            strata2 = s[j],
+            estimate1 = e[i],
+            estimate2 = e[j],
+            variance1 = v[i],
+            variance2 = v[j],
+            p.value = 2 * (1 - pnorm(z.log))
+          )
         }))
-      }
-  }))
+      }))
+    }
 }))
 rownames(diffs) <- NULL
 write_xlsx(diffs, file.path(outdir, 'diffs.xlsx'))
