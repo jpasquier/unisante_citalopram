@@ -1,212 +1,235 @@
 library(broom)
 library(dplyr)
 library(ggplot2)
-library(readxl)
+library(haven)
+library(parallel)
+library(rlang)
 library(survival)
 library(survminer)
 library(wesanderson)
 library(writexl)
 
+options(mc.cores = detectCores() - 1)
+
+# Help function
+# https://stackoverflow.com/questions/68084740
+catch_warn <- function(expr) {
+  res <- suppressWarnings(tryCatch(
+    expr = {
+      withCallingHandlers(
+        expr = expr,
+        warning = function(w) {
+          parent <- parent.env(environment())
+          parent$warning_arg <- w
+        }
+      )
+    }
+  ))
+  w <- if ("warning_arg" %in% ls()) {
+    as.character(warning_arg)
+  } else {
+    NULL
+  }
+  return(list(result = res, warning = w))
+}
+
 # Working directory
 setwd('~/Projects/Consultations/Coumau Aude (CYP2C19)')
 
-# Criterion
-K <- 1
-
 # Output directory
-outdir <- paste0('results/survival_analyses_', format(Sys.Date(), '%Y%m%d'),
-                 '/criterion', K)
+outdir <- paste0('results/survival_analyses_',
+                 format(Sys.Date(), '%Y%m%d'))
 if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
 
 # Load data
-rawDataFile <- if (K == 1) {
-  'data/Criteres-non-rep-cery-GENERALISE_Pour_Jerome.xlsx'
-} else {
-  'data/Criteres-non-rep-cery-GENERALISE_Pour_Jerome2.xlsx'
-}
-rawData <- read_xlsx(rawDataFile) %>%
-  mutate(DATE_OBS = as.Date(DATE_OBS), DATE_INIT_TTT = as.Date(DATE_INIT_TTT))
+raw_data <- read_dta(
+  'data/Criteres-non-rep-cery-GENERALISE_Pour_Jerome_score_activite_V3.dta')
 
-# Check that there is only one DATE_INIT_TTT and one PHENO_2C19 per IPP
-all(aggregate(DATE_INIT_TTT ~ IPP, rawData,
-              function(x) length(unique(x)) == 1)[[2]])
-all(aggregate(PHENO_2C19 ~ IPP, rawData,
-              function(x) length(unique(x)) == 1)[[2]])
-
-# If an event and a non-event are observed simultaneously for the same
-# IPP/Date, we keep only the event.
-rawData <- rawData %>%
-  group_by(IPP, DATE_OBS, DATE_INIT_TTT, PHENO_2C19) %>%
-  summarise(Critere = sum(Critere) > 0, .groups = 'drop')
-
-# Sort data by IPP and DATE_OBS
-rawData <- arrange(rawData, IPP, DATE_OBS)
-
-# Survival data
-survData <- rawData %>%
-  select(IPP, DateInitTTT = DATE_INIT_TTT, Pheno2C19 = PHENO_2C19) %>%
-  unique() %>%
-  left_join(
-    by = 'IPP',
-    rawData %>%
-      group_by(IPP) %>%
-      mutate(
-        DATE_OBS = as.Date(DATE_OBS),
-        Event = cumsum(Critere)
-      ) %>%
-      summarise(
-        DateFirstObs = min(DATE_OBS),
-        DateBeforeEvent = suppressWarnings(max(DATE_OBS[Event == 0])),
-        DateAfterEvent = suppressWarnings(min(DATE_OBS[Event == 1])),
-        Event = any(Event > 0)
-      )
-  ) %>%
-  mutate(
-    Pheno2C19 = factor(Pheno2C19),
-    # Pheno2C19 = factor(case_when(
-    #               Pheno2C19 %in% c('EMIM', 'UM') ~ 'EMIM/UM',
-    #               Pheno2C19 == 'PM' ~ 'PM'
-    #             )),
-    Observed = !(Event & DateFirstObs == DateAfterEvent |
-                 !Event & DateFirstObs == DateBeforeEvent),
-    TimeFirstObs = as.numeric(DateFirstObs - DateInitTTT),
-    Obs365 = Observed & TimeFirstObs <= 365,
-    TimeBeforeEvent = if_else(
-      Observed, as.numeric(DateBeforeEvent - DateInitTTT), NA_real_),
-    TimeAfterEvent = if_else(
-      Observed, as.numeric(DateAfterEvent - DateInitTTT), NA_real_),
-    TimeSurv = if_else(Event, TimeAfterEvent, TimeBeforeEvent),
-    # TimeSurv = if_else(Event, (TimeAfterEvent - TimeBeforeEvent) / 2,
-    #                    TimeBeforeEvent),
-    SurvLeftTrunc = Surv(time = TimeFirstObs, time2 = TimeSurv, event = Event)
-  )
-
-# Overview of individual survivals
-surv.paths <- survData %>%
-  filter(Observed) %>%
-  mutate(IPP = factor(IPP, IPP[order(TimeSurv)])) %>%
-  ggplot(aes(colour = Pheno2C19)) +
-  geom_segment(aes(y = IPP, yend = IPP, x = 0, xend = TimeFirstObs),
-               linetype = 'dotted') +
-  geom_segment(aes(y = IPP, yend = IPP, x = TimeFirstObs, xend = TimeSurv)) +
-  geom_point(aes(y = IPP, x = TimeBeforeEvent), shape = 1) +
-  geom_point(aes(y = IPP, x = TimeAfterEvent), shape = 4) +
-  geom_vline(xintercept = 365, color = 'grey', linetype = 'dashed') +
-  theme(axis.text.y = element_text(size = 6),
-        legend.position = 'bottom')
-svg(file.path(outdir, 'surv_paths.svg'), width = 14, height = 35)
-print(surv.paths)
-dev.off()
-
-# KM analyses
-# Log rank test with left truncated data:
-# see https://stat.ethz.ch/pipermail/r-help/2009-August/399999.html
-km.fit <- list(
-  ltrunc    = survfit(SurvLeftTrunc ~ Pheno2C19, filter(survData, Observed)),
-  ltrunc365 = survfit(SurvLeftTrunc ~ Pheno2C19, filter(survData, Obs365))
-)
-
-# Log rank test p-values
-cox.fit.ltrunc <- coxph(SurvLeftTrunc ~ Pheno2C19, filter(survData, Observed))
-summary(cox.fit.ltrunc)$sctest['pvalue']
-cox.fit.ltrunc365 <- coxph(SurvLeftTrunc ~ Pheno2C19, filter(survData, Obs365))
-summary(cox.fit.ltrunc365)$sctest['pvalue']
-
-# Export survival data
-list(
-  data = survData,
-  table_ltrunc = tidy(km.fit$ltrunc),
-  table_ltrunc365 = tidy(km.fit$ltrunc365)
-) %>%
-  write_xlsx(file.path(outdir, 'survival_data.xlsx'))
-
-# KM curves
-km.figs <- lapply(names(km.fit) %>% setNames(., .), function(s) {
-  fit <- km.fit[[s]]
-  if (s == 'ltrunc') {
-    p <- ggsurvplot(
-      fit,
-      pval = round(summary(get(paste0('cox.fit.', s)))$sctest['pvalue'], 3),
-      conf.int = TRUE,
-      risk.table = TRUE,
-      risk.table.col = "strata",
-      ggtheme = theme_bw(),
-      palette = wes_palette('Darjeeling1', length(fit$strata))
-    )
-    p$plot <- p$plot +
-      geom_vline(xintercept = 365, color = 'grey', linetype = 'dashed')
-  } else {
-    p <- ggsurvplot(
-      fit,
-      pval = round(summary(get(paste0('cox.fit.', s)))$sctest['pvalue'], 3),
-      conf.int = TRUE,
-      risk.table = TRUE,
-      risk.table.col = "strata",
-      ggtheme = theme_bw(),
-      xlim = c(0, 365),
-      break.time.by = 30,
-      palette = wes_palette('Darjeeling1', length(fit$strata))
-    )
-  }
-  p
-})
-for (s in names(km.figs)) {
-  fig <- km.figs[[s]]
-  svg(file.path(outdir, paste0('km_', s, '.svg')),
-      width = 14, height = 7)
-  print(fig)
-  dev.off()
-}
-rm(fig, s)
-
-# Differences at 1, 2, 3, 6 and 12 months
-# https://dominicmagirr.github.io/post/2022-01-18-be-careful-with-standard-errors-in-survival-survfit/
-diffs <- do.call(rbind, lapply(round(365.2425 / 12 * c(1:3, 6, 12)),
-                               function(d) {
-  fit <- km.fit$ltrunc365
-  tidy(fit) %>%
-    mutate(
-      strata = sub('^Pheno2C19=', '', strata),
-      var.survival = estimate^2 * std.error^2,
-      var.log.survival = std.error^2,
-    ) %>%
-    group_by(strata) %>%
-    filter(time == suppressWarnings(max(time[time <= d]))) %>%
-    {
-      s <- .$strata
-      e <- .$estimate
-      v <- .$var.survival
-      w <- .$var.log.survival
-      do.call(rbind, lapply(1:(length(s) - 1), function(i) {
-        do.call(rbind, lapply((i + 1):length(s), function(j) {
-          z.plain <- abs(e[i] - e[j]) / sqrt(v[i] + v[j])
-          z.log <- abs(log(e[i]) - log(e[j])) / sqrt(w[i] + w[j])
-          data.frame(
-            day = d,
-            fit = 'ltrunc365',
-            strata1 = s[i],
-            strata2 = s[j],
-            estimate1 = e[i],
-            estimate2 = e[j],
-            variance1 = v[i],
-            variance2 = v[j],
-            p.value = 2 * (1 - pnorm(z.log))
-          )
-        }))
-      }))
-    }
+# Survival analyses
+groups <- c('PHENO_2C19', 'P_phenotype_2C19', 'PHENO_EXTREME')
+events <- c('CRIT_FULL', 'CRIT_QUET', 'CRIT_MIRTA', 'CRIT_ARIPI', 'CRIT_LIT',
+            'CRIT_DEUX_AD', 'CRIT_ARRET', 'CRIT_SWITCH', 'CRIT_DOSE_MAX',
+            'CRIT_DOSE_MIN', 'CRIT_SWITCH_ARRET_QUET',
+            'CRIT_SWITCH_ARRET_DEUX_AD', 'CRIT_SWITCH_ARRET')
+R <- unlist(recursive =FALSE, lapply(groups %>% setNames(., .), function(g) {
+  lapply(events %>% setNames(., .), function(e) list(group = g, event = e))
 }))
-rownames(diffs) <- NULL
-write_xlsx(diffs, file.path(outdir, 'diffs.xlsx'))
+R <- mclapply(R, function(r) {
+  # print(paste(r$group, r$event))
+  # Survival data
+  # * If an event and a non-event are observed simultaneously for the same
+  #   IPP/Date, we keep only the event.
+  # * The group is defined at the first observation
+  surv_data <- raw_data %>%
+    group_by(IPP, date_obs = DATE_OBS, date_init_ttt = DATE_INIT_TTT,
+             group = !!sym(r$group)) %>%
+    summarise(event = sum(!!sym(r$event)) > 0, .groups = 'drop') %>%
+    arrange(IPP, date_obs) %>%
+    group_by(IPP) %>%
+    mutate(
+      event = cumsum(event)
+    ) %>%
+    summarise(
+      date_first_obs = date_obs[1],
+      group = group[1],
+      date_init_ttt = date_init_ttt[1],
+      date_before_event = suppressWarnings(max(date_obs[event == 0])),
+      date_after_event = suppressWarnings(min(date_obs[event == 1])),
+      event = any(event > 0)
+    ) %>%
+    mutate(
+      group = factor(group),
+      observed = !(event & date_first_obs == date_after_event |
+                   !event & date_first_obs == date_before_event),
+      time_first_obs = as.numeric(date_first_obs - date_init_ttt),
+      obs_365 = observed & time_first_obs <= 365,
+      time_before_event = if_else(
+        observed, as.numeric(date_before_event - date_init_ttt), NA_real_),
+      time_after_event = if_else(
+        observed, as.numeric(date_after_event - date_init_ttt), NA_real_),
+      time_surv = if_else(event, time_after_event, time_before_event),
+      surv = Surv(time = time_first_obs, time2 = time_surv, event = event)
+    )
+  # Overview of individual survivals
+  surv_paths <- surv_data %>%
+    filter(observed) %>%
+    mutate(IPP = factor(IPP, IPP[order(time_surv)])) %>%
+    ggplot(aes(colour = group)) +
+    geom_segment(aes(y = IPP, yend = IPP, x = 0, xend = time_first_obs),
+                 linetype = 'dotted') +
+    geom_segment(aes(y = IPP, yend = IPP, x = time_first_obs,
+                     xend = time_surv)) +
+    geom_point(aes(y = IPP, x = time_before_event), shape = 1) +
+    geom_point(aes(y = IPP, x = time_after_event), shape = 4) +
+    geom_vline(xintercept = 365, color = 'grey', linetype = 'dashed') +
+    theme(axis.text.y = element_text(size = 6),
+          legend.position = 'bottom')
+  # KM analyses
+  # Log rank test with left truncated data:
+  # see https://stat.ethz.ch/pipermail/r-help/2009-August/399999.html
+  d <- list(lt     = filter(surv_data, observed),
+            lt_365 = filter(surv_data, obs_365))
+  km_fits <- list(
+    lt     = survfit(surv ~ group, d$lt),
+    lt_365 = survfit(surv ~ group, d$lt_365)
+  ) %>%
+    lapply(function(fit) {
+      names(fit$strata) <- sub('^group=', '', names(fit$strata))
+      fit
+    })
+  for (z in names(km_fits)) attr(km_fits[[z]], 'data') <- d[[z]]
+  # Cox analyses
+  cox_fits <- list(
+    lt = catch_warn(coxph(surv ~ group, filter(surv_data, observed))),
+    lt_365 = catch_warn(coxph(surv ~ group, filter(surv_data, obs_365)))
+  )
+  # KM curves
+  km_figs <- lapply(names(km_fits) %>% setNames(., .), function(s) {
+    fit <- km_fits[[s]]
+    data <- attr(fit, 'data')
+    pv <- round(summary(cox_fits[[s]]$result)$sctest['pvalue'], 3)
+    if (!is.null(cox_fits[[s]]$warning)) paste0(pv, '*')
+    if (s == 'lt') {
+      p <- ggsurvplot(
+        fit,
+        data = data,
+        pval = pv,
+        conf.int = TRUE,
+        risk.table = TRUE,
+        risk.table.col = "strata",
+        ggtheme = theme_bw(),
+        palette = wes_palette('Darjeeling1', length(fit$strata))
+      )
+      p$plot <- p$plot +
+        geom_vline(xintercept = 365, color = 'grey', linetype = 'dashed')
+    } else {
+      p <- ggsurvplot(
+        fit,
+        data = data,
+        pval = pv,
+        conf.int = TRUE,
+        risk.table = TRUE,
+        risk.table.col = "strata",
+        ggtheme = theme_bw(),
+        xlim = c(0, 365),
+        break.time.by = 30,
+        palette = wes_palette('Darjeeling1', length(fit$strata))
+      )
+    }
+    if (!is.null(cox_fits[[s]]$warning)) {
+      p <- p +
+        labs(caption = paste('* Warning (calculation of the p-value):',
+                             cox_fits[[s]]$warning))
+    }
+    p
+  })
+  # Differences at 1, 2, 3, 6 and 12 months
+  # https://dominicmagirr.github.io/post/2022-01-18-be-careful-with-standard-errors-in-survival-survfit/
+  diffs <- do.call(rbind, lapply(round(365.2425 / 12 * c(1:3, 6, 12)),
+                                 function(d) {
+    fit <- km_fits$lt_365
+    tidy(fit) %>%
+      mutate(
+        var.survival = estimate^2 * std.error^2,
+        var.log.survival = std.error^2,
+      ) %>%
+      group_by(strata) %>%
+      filter(time == suppressWarnings(max(time[time <= d]))) %>%
+      {
+        s <- .$strata
+        e <- .$estimate
+        v <- .$var.survival
+        w <- .$var.log.survival
+        do.call(rbind, lapply(1:(length(s) - 1), function(i) {
+          do.call(rbind, lapply((i + 1):length(s), function(j) {
+            z_plain <- abs(e[i] - e[j]) / sqrt(v[i] + v[j])
+            z_log <- abs(log(e[i]) - log(e[j])) / sqrt(w[i] + w[j])
+            data.frame(
+              day = d,
+              fit = 'lt_365',
+              strata_1 = s[i],
+              strata_2 = s[j],
+              surv_1 = e[i],
+              surv_2 = e[j],
+              var_surv_1 = v[i],
+              var_surv_2 = v[j],
+              log_surv_1 = log(e[i]),
+              log_surv_2 = log(e[j]),
+              var_log_surv_1 = w[i],
+              var_log_surv_2 = w[j],
+              p_value = 2 * (1 - pnorm(z_log))
+            )
+          }))
+        }))
+      }
+  }))
+  rownames(diffs) <- NULL
+  list(surv_data = surv_data, surv_paths = surv_paths, km_fits = km_fits,
+       cox_fits = cox_fits, km_figs = km_figs, diffs = diffs)
+})
 
-###############################################################################
-# survfit(SurvLeftTrunc ~ Pheno2C19, survData, conf.type = 'log') %>%
-#   tidy() %>%
-#   mutate(ci.upr = exp(log(estimate) + qnorm(0.975) * std.error),
-#          ci.lwr = exp(log(estimate) - qnorm(0.975) * std.error)) %>%
-#   select(estimate, std.error, conf.high, ci.upr, conf.low, ci.lwr)%>%
-#   as.data.frame()
-###############################################################################
+# Export results
+for (s in names(R)) {
+  o <- file.path(outdir, s)
+  if (!dir.exists(o)) dir.create(o)
+  r <- R[[s]]
+  write_xlsx(path = file.path(o, 'survival_tables.xlsx'), list(
+    all                    = tidy(r$km_fits$lt),
+    observed_before_day365 = tidy(r$km_fits$lt_365),
+    survival_data          = r$surv_data
+  ))
+  svg(file.path(o, 'surv_paths.svg'), width = 14, height = 35)
+  print(r$surv_paths)
+  dev.off()
+  for (z in names(r$km_figs)) {
+    svg(file.path(o, paste0('km_', z, '.svg')),
+        width = 14, height = 7)
+    print(r$km_figs[[z]])
+    dev.off()
+  }
+  write_xlsx(r$diffs, file.path(o, 'diffs.xlsx'))
+}
+rm(s, o, r, z)
 
 # Session info
 sink(file.path(outdir, 'sessionInfo.txt'))
