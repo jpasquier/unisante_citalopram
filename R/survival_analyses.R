@@ -1,8 +1,10 @@
 library(broom)
 library(dplyr)
 library(ggplot2)
+library(here)
 library(lubridate)
 library(parallel)
+library(purrr)
 library(readxl)
 library(rlang)
 library(survival)
@@ -27,7 +29,7 @@ catch_warn <- function(expr) {
     }
   ))
   w <- if ("warning_arg" %in% ls()) {
-    as.character(warning_arg)
+    trimws(as.character(warning_arg))
   } else {
     NULL
   }
@@ -37,17 +39,17 @@ catch_warn <- function(expr) {
 source(paste0("https://raw.githubusercontent.com/cran/RcmdrPlugin.KMggplot2/",
               "master/R/geom-stepribbon.r"))
 
-# Working directory
-setwd("~/Projects/Consultations/Coumau Aude (CYP2C19)")
+# Set project directory
+i_am("R/survival_analyses.R")
 
 # Output directory
-outdir <- paste0("results/survival_analyses_",
-                 format(Sys.Date(), "%Y%m%d"))
+outdir <- here("results", paste0("survival_analyses_",
+                                 format(Sys.Date(), "%Y%m%d")))
 if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
 
 # Load data
-raw_data <- read_xlsx(
-  "data/Criteres-non-rep-cery-GENERALISE_Pour_Jerome_score_activite_V3.xlsx")
+raw_data <- read_xlsx(here(
+  "data/Criteres-non-rep-cery-GENERALISE_Pour_Jerome_score_activite_V3.xlsx"))
 
 # Recode dates
 raw_data <- raw_data %>%
@@ -206,8 +208,8 @@ R <- mclapply(R, function(r) {
   # KM analysis
   km_fit <- survfit(surv ~ group, surv_data_1)
   names(km_fit$strata) <- sub("^group=", "", names(km_fit$strata))
-  # Log rank test
-  lr_tests <- do.call(bind_rows, lapply(limits, function(l) {
+  # Log rank tests
+  lr_tests_1 <- map_dfr(limits, function(l) {
     d <- surv_data_1 %>%
       select(IPP, group, time_first_obs, time_surv, event) %>%
       filter(time_first_obs < l) %>%
@@ -222,19 +224,19 @@ R <- mclapply(R, function(r) {
     tibble(
       limit = l,
       logrank_pv = pv$result,
-      logrank_pv_warning = pv$warning
+      warning = pv$warning
     )
-  }))
+  })
   # KM survival table
   km_surv_tab <- tidy(km_fit)
   # KM curves
-  km_figs <- lapply(limits, function(l) {
-    pv <- round(pull(filter(lr_tests, limit == l), logrank_pv), 3)
+  km_figs <- map(limits, function(l) {
+    pv <- round(pull(filter(lr_tests_1, limit == l), logrank_pv), 3)
     l <- min(l, max(surv_data_1$time_surv, na.rm = TRUE))
-    ggsurvplot(
+    p <- ggsurvplot(
       km_fit,
       data = surv_data_1,
-      pval = pv,
+      #pval = pv,
       conf.int = TRUE,
       risk.table = TRUE,
       risk.table.col = "strata",
@@ -243,35 +245,87 @@ R <- mclapply(R, function(r) {
       ggtheme = theme_bw(),
       palette = wes_palette("Darjeeling1", length(km_fit$strata))
     )
+    p$plot <- p$plot + annotate("text", x = 0, y = 0, label = paste("p =", pv))
+    return(p)
   })
-  # Cox regression
-  z <- catch_warn(coxph(surv ~ group, surv_data_2))
-  cox_fit <- z$result
-  attr(cox_fit, "warning") <- z$warning
-  # Cox survival table
-  grps <- levels(surv_data_2$group)
-  cox_surv_tab <- do.call(bind_rows, lapply(grps, function(g) {
-    survfit(cox_fit, newdata = data.frame(group = g)) %>%
-      tidy() %>%
-      mutate(strata = g)
-  }))
-  # Cox curve
-  pv <- summary(cox_fit)$sctest[["pvalue"]]
-  cox_fig <- cox_surv_tab %>%
-    ggplot(aes(x = time, y = estimate, colour = strata, fill = strata)) +
-    geom_step() +
-    #geom_stepribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .5,
-    #                color = NA) +
-    annotate("text", x = 0, y = 0, label = paste("p =", round(pv, 3))) +
-    labs(x = "days", y = "survival probability") +
-    theme_bw()
-  # Graphical Test of Proportional Hazards
-  cox_fig_ph_test <- ggcoxzph(cox.zph(cox_fit))[[1]]
+  # Cox regressions (according to the observed treatment duration)
+  cox_fits <- map(limits, function(l) {
+    d <- surv_data_2 %>%
+      filter(time0 < l) %>%
+      mutate(
+        group = droplevels(group),
+        b = time1 > l,
+        time1 = if_else(b, l, time1),
+        event = if_else(b, FALSE, event),
+        surv = Surv(time0, time1, event)
+      )
+    z <- catch_warn(coxph(surv ~ group, d))
+    cox_fit <- z$result
+    attr(cox_fit, "warning") <- z$warning
+    # Cox survival table
+    grps <- levels(d$group)
+    cox_surv_tab <- do.call(bind_rows, lapply(grps, function(g) {
+      survfit(cox_fit, newdata = data.frame(group = g)) %>%
+        tidy() %>%
+        mutate(strata = g)
+    }))
+    # Cox curve
+    pv <- summary(cox_fit)$sctest[["pvalue"]]
+    cox_fig <- cox_surv_tab %>%
+      ggplot(aes(x = time, y = estimate, colour = strata, fill = strata)) +
+      geom_step() +
+      #geom_stepribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .5,
+      #                color = NA) +
+      annotate("text", x = 0, y = 0, label = paste("p =", round(pv, 3))) +
+      labs(x = "days", y = "survival probability") +
+      theme_bw()
+    # Graphical Test of Proportional Hazards
+    cox_fig_ph_test <- tryCatch(ggcoxzph(cox.zph(cox_fit))[[1]],
+                                error = function(e) NULL)
+    list(cox_fit = cox_fit, cox_surv_tab = cox_surv_tab, cox_fig = cox_fig,
+         cox_fig_ph_test = cox_fig_ph_test)
+  })
+  # Log rank tests using survival data by interval
+  lr_tests_2 <- map_dfr(names(cox_fits), function(l) {
+    fit <- cox_fits[[l]]$cox_fit
+    pv <- summary(fit)$sctest[["pvalue"]]
+    tibble(
+      limit = as.numeric(l),
+      logrank_pv = pv,
+      warning = attr(fit, "warning")
+    )
+  })
+  # Lists of results
+  surv_data <- list(
+    survival_data              = surv_data_1,
+    survival_data_by_intervall = surv_data_2
+  )
+  fits <- map(cox_fits, ~ .x$cox_fit) %>%
+    setNames(., paste0("cox_", names(.))) %>%
+    append(list(km = km_fit), after = 0)
+  lr_tests <- list(
+    fixed_group         = lr_tests_1,
+    time_varying_groups = lr_tests_2
+  )
+  surv_tabs <- map(cox_fits, ~ .x$cox_surv_tab) %>%
+    setNames(., paste0("cox_", names(.))) %>%
+    append(list(km = km_surv_tab), after = 0)
+  surv_figs <- append(
+    km_figs %>% setNames(., paste0("km_", names(.))),
+    map(cox_fits, ~ .x$cox_fig) %>% setNames(., paste0("cox_", names(.)))
+  )
+  ph_test_figs <- map(cox_fits, ~ .x$cox_fig_ph_test)
+  risk_ratios <- map(cox_fits, ~ {
+    tidy(.x$cox_fit, exponentiate = TRUE, conf.int=TRUE) %>%
+      select(term, estimate, std.error, conf.low, conf.high, p.value)
+  }) %>%
+    setNames(., paste0("cox_", names(.)))
   # Differences
   # https://dominicmagirr.github.io/post/2022-01-18-be-careful-with-standard-errors-in-survival-survfit/
-  diffs <- lapply(1:2, function(k) {
-    do.call(rbind, lapply(limits, function(l) {
-      d <- list(km_surv_tab, cox_surv_tab)[[k]] %>%
+  diffs <- lapply(names(surv_tabs), function(z) {
+    K <- if (grepl("cox", z)) min(as.numeric(sub("cox_", "", z)), 365) else 365
+    do.call(rbind, lapply(limits[limits <= K], function(l) {
+      d <- surv_tabs[[z]] %>%
         mutate(var.log.survival = std.error^2) %>%
         group_by(strata) %>%
         filter(time == suppressWarnings(max(time[time <= l])))
@@ -279,7 +333,7 @@ R <- mclapply(R, function(r) {
       s <- d$strata
       e <- d$estimate
       w <- d$var.log.survival
-      z <- do.call(rbind, lapply(1:(length(s) - 1), function(i) {
+      do.call(rbind, lapply(1:(length(s) - 1), function(i) {
         do.call(rbind, lapply((i + 1):length(s), function(j) {
           z_log <- abs(log(e[i]) - log(e[j])) / sqrt(w[i] + w[j])
           pv <- if (e[i] < 1 & e[j] < 1) 2 * (1 - pnorm(z_log)) else NA
@@ -293,18 +347,13 @@ R <- mclapply(R, function(r) {
           )
         }))
       }))
-      names(z)[4:6] <- paste0(c("km_", "cox_")[k], names(z)[4:6])
-      z
     }))
-  }) %>%
-    {full_join(.[[1]], .[[2]], by = names(.[[1]])[1:3])} %>%
-    arrange(day, strata_1, strata_2)
+  })
+  rownames(diffs) <- NULL
   # All results in a list
-  list(surv_data_1 = surv_data_1, surv_data_2 = surv_data_2,
-       surv_paths = surv_paths, km_fit = km_fit, lr_tests = lr_tests,
-       km_surv_tab = km_surv_tab, km_figs = km_figs,
-       cox_fit = cox_fit, cox_surv_tab = cox_surv_tab, cox_fig = cox_fig,
-       cox_fig_ph_test = cox_fig_ph_test, diffs = diffs)
+  list(surv_data = surv_data, surv_paths = surv_paths, fits = fits,
+       lr_tests = lr_tests, surv_tabs = surv_tabs, surv_figs = surv_figs,
+       ph_test_figs = ph_test_figs, risk_ratios = risk_ratios, diffs = diffs)
 })
 
 # Export results
@@ -312,27 +361,26 @@ for (s in names(R)) {
   o <- file.path(outdir, s)
   if (!dir.exists(o)) dir.create(o)
   r <- R[[s]]
-  write_xlsx(path = file.path(o, "survival_data.xlsx"), list(
-    survival_data              = r$surv_data_1,
-    survival_data_by_intervall = r$surv_data_2
-  ))
+  write_xlsx(r$surv_data, file.path(o, "survival_data.xlsx"))
   svg(file.path(o, "surv_paths.svg"), width = 14, height = 35)
   print(r$surv_paths)
   dev.off()
   write_xlsx(r$lr_tests, file.path(o, "logrank_tests.xlsx"))
-  write_xlsx(list(km = r$km_surv_tab, cox = r$cox_surv_tab),
-             file.path(o, "survival_tables.xlsx"))
-  for (l in names(r$km_figs)) {
-    svg(file.path(o, paste0("km_fig_", l, ".svg")), width = 14, height = 7)
-    print(r$km_figs[[l]])
+  write_xlsx(r$surv_tabs, file.path(o, "survival_tables.xlsx"))
+  for (l in names(r$surv_figs)) {
+    svg(file.path(o, paste0("fig_", l, ".svg")), width = 14, height = 7)
+    print(r$surv_figs[[l]])
     dev.off()
   }
-  svg(file.path(o, "cox_fig.svg"), width = 14, height = 7)
-  print(r$cox_fig)
-  dev.off()
-  svg(file.path(o, "cox_fig_ph_test.svg"), width = 14, height = 7)
-  print(r$cox_fig_ph_test)
-  dev.off()
+  for (l in names(r$ph_test_figs)) {
+    if (!is.null(r$ph_test_figs[[l]])) {
+      svg(file.path(o, paste0("fig_ph_test_", l, ".svg")),
+          width = 14, height = 7)
+      print(r$ph_test_figs[[l]])
+      dev.off()
+    }
+  }
+  write_xlsx(r$risk_ratios, file.path(o, "risk_ratios.xlsx"))
   write_xlsx(r$diffs, file.path(o, "diffs.xlsx"))
 }
 rm(s, o, r, l)
