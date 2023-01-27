@@ -119,10 +119,9 @@ if (any(duplicated(varying_covariates[c("IPP", "time0")])))
 # Survival analyses
 groups <- c("PHENO_2C19", "P_phenotype_2C19", "PHENO_EXTREME")
 events <- grep("^CRIT_", names(raw_data), value = TRUE)
-min_cens_times <- c(0, 60, 90, 120, 180, 365)
 R <- unlist(recursive = FALSE, lapply(groups %>% setNames(., .), function(g) {
   unlist(recursive = FALSE, lapply(events %>% setNames(., .), function(e) {
-    lapply(min_cens_times %>% setNames(., .), function(m) {
+    lapply(c(`0` = 0, `365` = 365), function(m) {
       list(group = g, event = e, min_cens_time = m)
     })
   }))
@@ -260,37 +259,58 @@ R <- mclapply(R, function(r) {
         surv = Surv(time0, time1, event)
       )
     z <- catch_warn(coxph(surv ~ group, d))
-    cox_fit <- z$result
-    attr(cox_fit, "warning") <- z$warning
-    # Cox survival table
-    grps <- levels(d$group)
-    cox_surv_tab <- do.call(bind_rows, lapply(grps, function(g) {
-      survfit(cox_fit, newdata = data.frame(group = g)) %>%
-        tidy() %>%
-        mutate(strata = g)
-    }))
-    # Cox curve
-    pv <- summary(cox_fit)$sctest[["pvalue"]]
-    cox_fig <- cox_surv_tab %>%
-      ggplot(aes(x = time, y = estimate, colour = strata, fill = strata)) +
-      geom_step() +
-      #geom_stepribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .5,
-      #                color = NA) +
-      annotate("text", x = 0, y = 0, label = paste("p =", round(pv, 3))) +
-      labs(x = "days", y = "survival probability") +
-      theme_bw()
-    # Graphical Test of Proportional Hazards
-    cox_fig_ph_test <- tryCatch(ggcoxzph(cox.zph(cox_fit))[[1]],
-                                error = function(e) NULL)
-    list(cox_fit = cox_fit, cox_surv_tab = cox_surv_tab, cox_fig = cox_fig,
-         cox_fig_ph_test = cox_fig_ph_test)
+    fit <- z$result
+    attr(fit, "warning") <- z$warning
+    attr(fit, "limit") <- l
+    attr(fit, "groups") <- levels(d$group)
+    fit
   })
   # Log rank tests using survival data by interval
-  lr_tests_2 <- map_dfr(names(cox_fits), function(l) {
-    fit <- cox_fits[[l]]$cox_fit
+  lr_tests_2 <- map_dfr(cox_fits, function(fit) {
     pv <- summary(fit)$sctest[["pvalue"]]
     tibble(
-      limit = as.numeric(l),
+      limit = attr(fit, "limit"),
+      logrank_pv = pv,
+      warning = attr(fit, "warning")
+    )
+  })
+  # Cox survival table
+  cox_surv_tabs <- map(cox_fits[c("365", "Inf")], function(fit) {
+    map_dfr(attr(fit, "groups"), function(g) {
+      survfit(fit, newdata = data.frame(group = g)) %>%
+        tidy() %>%
+        mutate(strata = g)
+    })
+  })
+  # Cox curves
+  cox_figs <- map(cox_surv_tabs, function(tab) {
+    ggplot(tab, aes(x = time, y = estimate, colour = strata)) +
+      geom_step() +
+      labs(x = "days", y = "survival probability") +
+      theme_bw()
+  })
+  cox_figs <- unlist(map(names(cox_figs) %>% setNames(., .), function(k) {
+    z <- as.numeric(k)
+    map(limits[limits <= z], function(l) {
+      if (l < z) {
+        cox_figs[[k]] + xlim(c(0, l))
+      } else {
+        pv <- round(pull(filter(lr_tests_2, limit == z), logrank_pv), 3)
+        cox_figs[[k]] +
+          annotate("text", x = 0, y = 0, label = paste("p =", pv))
+      }
+    })
+  }), recursive = FALSE)
+  names(cox_figs) <- gsub("\\.", "_", names(cox_figs))
+  # Graphical Test of Proportional Hazards
+  ph_test_figs <- map(cox_fits[c("365", "Inf")], function(fit) {
+    tryCatch(ggcoxzph(cox.zph(fit))[[1]], error = function(e) NULL)
+  })
+  # Log rank tests using survival data by interval
+  lr_tests_2 <- map_dfr(cox_fits, function(fit) {
+    pv <- summary(fit)$sctest[["pvalue"]]
+    tibble(
+      limit = attr(fit, "limit"),
       logrank_pv = pv,
       warning = attr(fit, "warning")
     )
@@ -307,22 +327,21 @@ R <- mclapply(R, function(r) {
     fixed_group         = lr_tests_1,
     time_varying_groups = lr_tests_2
   )
-  surv_tabs <- map(cox_fits, ~ .x$cox_surv_tab) %>%
+  surv_tabs <- cox_surv_tabs %>%
     setNames(., paste0("cox_", names(.))) %>%
     append(list(km = km_surv_tab), after = 0)
   surv_figs <- append(
     km_figs %>% setNames(., paste0("km_", names(.))),
-    map(cox_fits, ~ .x$cox_fig) %>% setNames(., paste0("cox_", names(.)))
+    cox_figs %>% setNames(., paste0("cox_", names(.)))
   )
-  ph_test_figs <- map(cox_fits, ~ .x$cox_fig_ph_test)
-  risk_ratios <- map(cox_fits, ~ {
-    tidy(.x$cox_fit, exponentiate = TRUE, conf.int=TRUE) %>%
+  risk_ratios <- map(cox_fits[c("365", "Inf")], ~ {
+    tidy(.x, exponentiate = TRUE, conf.int=TRUE) %>%
       select(term, estimate, std.error, conf.low, conf.high, p.value)
   }) %>%
     setNames(., paste0("cox_", names(.)))
   # Differences
   # https://dominicmagirr.github.io/post/2022-01-18-be-careful-with-standard-errors-in-survival-survfit/
-  diffs <- lapply(names(surv_tabs), function(z) {
+  diffs <- lapply(names(surv_tabs) %>% setNames(., .), function(z) {
     K <- if (grepl("cox", z)) min(as.numeric(sub("cox_", "", z)), 365) else 365
     do.call(rbind, lapply(limits[limits <= K], function(l) {
       d <- surv_tabs[[z]] %>%
